@@ -10,21 +10,71 @@ Analyzes uploaded room images and provides interior design suggestions
 import os
 import base64
 import json
+import urllib.request
+import urllib.error
 from typing import Dict, List, Optional
-from openai import OpenAI
 from PIL import Image
 import io
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Load API key from environment
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable not set. Please add it to your .env file")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=API_KEY)
+def get_api_key() -> str:
+    """Return the Gemini API key from the active env settings."""
+    api_key = (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable not set. Please add it to your .env file")
+    return api_key
+
+
+def call_gemini_api(prompt: str, image_data: Optional[str] = None) -> str:
+    """Call the Gemini REST API and return the generated text response."""
+    api_key = get_api_key()
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+
+    parts = [{"text": prompt}]
+    if image_data:
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": image_data,
+            }
+        })
+
+    payload = {"contents": [{"parts": parts}]}
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini API request failed: {detail}") from exc
+
+    candidates = result.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini API returned no candidates: {result}")
+
+    text_parts = []
+    for part in candidates[0].get("content", {}).get("parts", []):
+        if "text" in part:
+            text_parts.append(part["text"])
+
+    if not text_parts:
+        raise RuntimeError(f"Gemini API response did not include text: {result}")
+
+    return "".join(text_parts).strip()
 
 
 def compress_image_for_api(image_path: str, max_dimension: int = 1024, quality: int = 85) -> str:
@@ -279,8 +329,8 @@ Be specific and actionable. Provide 2-3 suggestions per category."""
             
             print(f"{'='*60}\n")
             
-            # Re-raise with more context
-            raise RuntimeError(f"OpenAI API call failed: {str(api_error)}") from api_error
+            # Re-raise with a user-friendly message for quota and auth issues
+            raise RuntimeError(format_openai_error(api_error)) from api_error
         
         # Extract response text from Chat Completions format
         try:

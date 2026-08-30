@@ -49,6 +49,19 @@ app.add_middleware(
 )
 
 
+def format_http_error_detail(message: str) -> str:
+    """Normalize backend errors so the frontend shows a clean message."""
+    lowered = message.lower()
+    if (
+        "credit_balance_exhausted" in lowered
+        or "insufficient_quota" in lowered
+        or "no credits remaining" in lowered
+        or "quota exhausted" in lowered
+    ):
+        return "OpenAI quota exhausted. Please add credits to your OpenAI account and try again."
+    return message
+
+
 # Routes
 @app.get("/")
 async def read_root():
@@ -320,7 +333,7 @@ async def generate_design(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to analyze room: {str(e)}"
+            detail=format_http_error_detail(f"Failed to analyze room: {str(e)}")
         )
 
 

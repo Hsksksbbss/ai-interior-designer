@@ -10,21 +10,83 @@ Analyzes uploaded room images and provides interior design suggestions
 import os
 import base64
 import json
+import urllib.request
+import urllib.error
 from typing import Dict, List, Optional
-from openai import OpenAI
 from PIL import Image
 import io
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Load API key from environment
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable not set. Please add it to your .env file")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=API_KEY)
+def get_api_key() -> str:
+    """Return the Gemini API key from the active env settings."""
+    api_key = (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable not set. Please add it to your .env file")
+    return api_key
+
+
+def get_model_name() -> str:
+    """Return the configured Gemini model name, defaulting to a model that is available."""
+    configured = os.getenv("GEMINI_MODEL")
+    if configured and configured.strip():
+        return configured.strip()
+    return "gemini-2.5-flash"
+
+
+def call_gemini_api(prompt: str, image_data: Optional[str] = None) -> str:
+    """Call the Gemini REST API and return the generated text response."""
+    api_key = get_api_key()
+    model_name = get_model_name()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+
+    parts = [{"text": prompt}]
+    if image_data:
+        parts.append({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": image_data,
+            }
+        })
+
+    payload = {"contents": [{"parts": parts}]}
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 404:
+            raise RuntimeError(
+                f"Gemini model '{model_name}' is unavailable. Set GEMINI_MODEL=gemini-2.5-flash in your .env file."
+            ) from exc
+        raise RuntimeError(f"Gemini API request failed: {detail}") from exc
+
+    candidates = result.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini API returned no candidates: {result}")
+
+    text_parts = []
+    for part in candidates[0].get("content", {}).get("parts", []):
+        if "text" in part:
+            text_parts.append(part["text"])
+
+    if not text_parts:
+        raise RuntimeError(f"Gemini API response did not include text: {result}")
+
+    return "".join(text_parts).strip()
 
 
 def get_language_instruction(language: str = "english") -> str:
@@ -32,6 +94,36 @@ def get_language_instruction(language: str = "english") -> str:
     if language == "bengali":
         return "IMPORTANT: Return ALL output in Bengali script. Use only Bengali language for all text, including JSON keys and values."
     return "IMPORTANT: Return ALL output in English."
+
+
+def format_openai_error(error: Exception) -> str:
+    """Convert AI provider exceptions into user-friendly messages."""
+    error_text = str(error).lower()
+
+    if (
+        "credit_balance_exhausted" in error_text
+        or "insufficient_quota" in error_text
+        or "no credits remaining" in error_text
+        or ("quota" in error_text and "exhausted" in error_text)
+        or ("quota" in error_text and "exceeded" in error_text)
+    ):
+        return "Gemini API quota exhausted. Please add credits to your Gemini account and try again."
+
+    if (
+        "incorrect api key" in error_text
+        or "invalid api key" in error_text
+        or ("api key" in error_text and "invalid" in error_text)
+        or "forbidden" in error_text
+    ):
+        return "Gemini API key is invalid or missing. Please check your GEMINI_API_KEY configuration."
+
+    if "429" in error_text or "rate limit" in error_text:
+        return "Gemini request limit reached. Please wait a moment and try again."
+
+    if "model" in error_text and "not found" in error_text:
+        return "The configured Gemini model is unavailable. Please check the backend model setting."
+
+    return f"Gemini API request failed: {error}"
 
 
 def compress_image_for_api(image_path: str, max_dimension: int = 1024, quality: int = 85) -> str:
@@ -246,62 +338,27 @@ Return ONLY valid JSON (no markdown, no code blocks) with this exact structure:
 
 Be specific and actionable. Provide 2-3 suggestions per category."""
         
-        # Call OpenAI Vision API using Chat Completions
-        print("Calling OpenAI Vision API for analysis...")
+        # Call Gemini Vision API
+        print("Calling Gemini API for analysis...")
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=1000,  # Increased for wall-painting with paint products
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": analysis_prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            )
-            print("OpenAI API call successful!")
+            response_text = call_gemini_api(analysis_prompt, image_data)
+            print("Gemini API call successful!")
         except Exception as api_error:
-            # Print detailed error information for debugging
             print(f"\n{'='*60}")
-            print(f"OPENAI API ERROR DETAILS")
+            print(f"GEMINI API ERROR DETAILS")
             print(f"{'='*60}")
             print(f"Error Type: {type(api_error).__name__}")
             print(f"Error Message: {str(api_error)}")
             print(f"Full Exception: {repr(api_error)}")
-            
-            # Print additional error attributes if available
-            if hasattr(api_error, 'response'):
-                print(f"\nResponse Status: {getattr(api_error.response, 'status_code', 'N/A')}")
-                print(f"Response Body: {getattr(api_error.response, 'text', 'N/A')}")
-            
-            if hasattr(api_error, 'message'):
-                print(f"Error Message Field: {api_error.message}")
-            
             print(f"{'='*60}\n")
-            
-            # Re-raise with more context
-            raise RuntimeError(f"OpenAI API call failed: {str(api_error)}") from api_error
-        
-        # Extract response text from Chat Completions format
+            raise RuntimeError(format_openai_error(api_error)) from api_error
+
         try:
-            response_text = response.choices[0].message.content.strip()
             print(f"Raw response received ({len(response_text)} characters)")
             print(f"First 200 chars: {response_text[:200]}")
         except Exception as e:
             print(f"ERROR: Failed to extract response text")
             print(f"Error: {str(e)}")
-            print(f"Response object: {repr(response)}")
             raise RuntimeError(f"Failed to extract response text: {str(e)}") from e
         
         # Remove markdown code blocks if present
@@ -547,31 +604,11 @@ Return ONLY this JSON format (no markdown or code blocks):
 
 Provide 3-4 furniture items. Create useful search links for Indian e-commerce."""
         
-        # Call OpenAI Vision API
-        print("Calling OpenAI Vision API for furniture analysis...")
+        # Call Gemini Vision API
+        print("Calling Gemini API for furniture analysis...")
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=1500,  # Higher limit for furniture with multiple items and links
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": furniture_prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            )
-            print("OpenAI API call successful!")
+            response_text = call_gemini_api(furniture_prompt, image_data)
+            print("Gemini API call successful!")
         except Exception as api_error:
             print(f"\n{'='*60}")
             print(f"FURNITURE ANALYSIS API ERROR")
@@ -579,17 +616,10 @@ Provide 3-4 furniture items. Create useful search links for Indian e-commerce.""
             print(f"Error Type: {type(api_error).__name__}")
             print(f"Error Message: {str(api_error)}")
             print(f"Full Exception: {repr(api_error)}")
-            
-            if hasattr(api_error, 'response'):
-                print(f"Response Status: {getattr(api_error.response, 'status_code', 'N/A')}")
-                print(f"Response Body: {getattr(api_error.response, 'text', 'N/A')}")
-            
             print(f"{'='*60}\n")
-            raise RuntimeError(f"OpenAI API call failed: {str(api_error)}") from api_error
-        
-        # Extract response text
+            raise RuntimeError(format_openai_error(api_error)) from api_error
+
         try:
-            response_text = response.choices[0].message.content.strip()
             print(f"Raw response received ({len(response_text)} characters)")
             print(f"First 200 chars: {response_text[:200]}")
         except Exception as e:
@@ -831,31 +861,11 @@ Return ONLY this JSON format (no markdown or code blocks):
 
 Create realistic search links for Indian e-commerce platforms."""
         
-        # Call OpenAI Vision API
-        print("Calling OpenAI Vision API for plants & decor analysis...")
+        # Call Gemini Vision API
+        print("Calling Gemini API for plants & decor analysis...")
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=1500,  # Higher limit for multiple items and links
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": plants_decor_prompt
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{image_data}"
-                                }
-                            }
-                        ]
-                    }
-                ]
-            )
-            print("OpenAI API call successful!")
+            response_text = call_gemini_api(plants_decor_prompt, image_data)
+            print("Gemini API call successful!")
         except Exception as api_error:
             print(f"\n{'='*60}")
             print(f"PLANTS & DECOR ANALYSIS API ERROR")
@@ -863,17 +873,10 @@ Create realistic search links for Indian e-commerce platforms."""
             print(f"Error Type: {type(api_error).__name__}")
             print(f"Error Message: {str(api_error)}")
             print(f"Full Exception: {repr(api_error)}")
-            
-            if hasattr(api_error, 'response'):
-                print(f"Response Status: {getattr(api_error.response, 'status_code', 'N/A')}")
-                print(f"Response Body: {getattr(api_error.response, 'text', 'N/A')}")
-            
             print(f"{'='*60}\n")
-            raise RuntimeError(f"OpenAI API call failed: {str(api_error)}") from api_error
-        
-        # Extract response text
+            raise RuntimeError(format_openai_error(api_error)) from api_error
+
         try:
-            response_text = response.choices[0].message.content.strip()
             print(f"Raw response received ({len(response_text)} characters)")
             print(f"First 200 chars: {response_text[:200]}")
         except Exception as e:
@@ -1123,20 +1126,11 @@ CONSTRAINTS:
 - Keep budget in mind for recommendations
 - Make recommendations practical and Vastu-aligned"""
         
-        # Call OpenAI API
-        print("Calling OpenAI API for smart house analysis...")
+        # Call Gemini API
+        print("Calling Gemini API for smart house analysis...")
         try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=2000,  # Higher limit for comprehensive analysis
-                messages=[
-                    {
-                        "role": "user",
-                        "content": smart_house_prompt
-                    }
-                ]
-            )
-            print("OpenAI API call successful!")
+            response_text = call_gemini_api(smart_house_prompt)
+            print("Gemini API call successful!")
         except Exception as api_error:
             print(f"\n{'='*60}")
             print(f"SMART HOUSE ANALYSIS API ERROR")
@@ -1144,17 +1138,10 @@ CONSTRAINTS:
             print(f"Error Type: {type(api_error).__name__}")
             print(f"Error Message: {str(api_error)}")
             print(f"Full Exception: {repr(api_error)}")
-            
-            if hasattr(api_error, 'response'):
-                print(f"Response Status: {getattr(api_error.response, 'status_code', 'N/A')}")
-                print(f"Response Body: {getattr(api_error.response, 'text', 'N/A')}")
-            
             print(f"{'='*60}\n")
-            raise RuntimeError(f"OpenAI API call failed: {str(api_error)}") from api_error
-        
-        # Extract response text
+            raise RuntimeError(format_openai_error(api_error)) from api_error
+
         try:
-            response_text = response.choices[0].message.content.strip()
             print(f"Raw response received ({len(response_text)} characters)")
             print(f"First 200 chars: {response_text[:200]}")
         except Exception as e:
